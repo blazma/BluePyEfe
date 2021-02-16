@@ -90,14 +90,16 @@ def process(config=None,
             voltage = voltage - ljp  # correct liquid junction potential
 
             # remove last 100 ms
-            voltage = voltage[0:int(-100. / dt)]
-            t = t[0:int(-100. / dt)]
+            if config['options']['remove_last_100ms']:
+                voltage = voltage[0:int(-100. / dt)]
+                t = t[0:int(-100. / dt)]
             ion = int(ton / dt)
             ioff = int(toff / dt)
             current = []
             current = numpy.zeros(len(voltage))
             current[ion:ioff] = amp
 
+            """
             if ('exclude' in cells[cellname] and
                 any(abs(cells[cellname]['exclude'][idx_file] - amp) <
                     1e-4)):
@@ -105,15 +107,16 @@ def process(config=None,
                 logger.info(" Not using trace with amplitude %f", amp)
 
             else:
-                data['voltage'].append(voltage)
-                data['current'].append(current)
-                data['t'].append(t)
+            """
+            data['voltage'].append(voltage)
+            data['current'].append(current)
+            data['t'].append(t)
 
-                data['dt'].append(numpy.float(dt))
-                data['ton'].append(numpy.float(ton))
-                data['toff'].append(numpy.float(toff))
-                data['amp'].append(numpy.float(amp))
-                data['hypamp'].append(numpy.float(hypamp))
-                data['filename'].append(filename)
+            data['dt'].append(numpy.float(dt))
+            data['ton'].append(numpy.float(ton))
+            data['toff'].append(numpy.float(toff))
+            data['amp'].append(numpy.float(amp))
+            data['hypamp'].append(numpy.float(hypamp))
+            data['filename'].append(filename)
 
     return data

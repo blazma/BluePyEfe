@@ -35,7 +35,7 @@ import pprint
 
 from itertools import cycle
 from collections import OrderedDict
-
+from collections import defaultdict
 
 from . import tools
 from .tools import tabletools
@@ -141,6 +141,12 @@ class Extractor(object):
         if "spike_threshold" not in self.options:
             self.options["spike_threshold"] = 2
 
+        if "steady_state_threshold" not in self.options:
+            self.options["steady_state_threshold"] = 8
+
+        if "remove_last_100ms" not in config["options"]:
+            config["options"]["remove_last_100ms"] = True
+
         if "logging" not in self.options:
             self.options["logging"] = False
 
@@ -191,6 +197,9 @@ class Extractor(object):
         self.extra_features = ['spikerate_tau_jj', 'spikerate_drop',
                                'spikerate_tau_log', 'spikerate_tau_fit',
                                'spikerate_tau_slope']
+        self.standard_currents = ['rheobase_current', 'steady_state_current', 'maxspike_current']
+        self.global_features = ['initial_fI_slope', 'average_fI_slope', 'maximum_fI_slope']
+        self.is_global_features_collected = False
 
     def newmeancell(self, a):
         if (self.options["nanmean_cell"] or
@@ -635,6 +644,129 @@ class Extractor(object):
                             stim_end=trace['stim_end'][0],
                         )
 
+                # collect number of spikes for each current injection
+                currents_spikecounts = defaultdict(OrderedDict)
+                for idx, filename in enumerate(dataset_cell_exp[expname]['filename']):
+                    numspike = dataset_cell_exp[expname]['features']['numspikes'][idx]
+                    current = dataset_cell_exp[expname]['amp'][idx]
+                    currents_spikecounts[filename][current] = numspike
+                self.dataset[cellname]['experiments'][expname]['currents_spikecounts'] = currents_spikecounts
+
+    def collect_global_features(self):
+        self.is_global_features_collected = True
+        steady_state_threshold = self.options["steady_state_threshold"]
+
+        for i_cell, cellname in enumerate(self.dataset):
+            dataset_cell_exp = self.dataset[cellname]['experiments']
+            for i_exp, expname in enumerate(dataset_cell_exp):
+                if 'currents_spikecounts' not in dataset_cell_exp[expname]:
+                    logging.info('Features must be collected before features for rheobase, steady-state current' +
+                                 ' or current with max number of spikes can be collected.')
+                    continue
+
+                if 'global_features' not in self.dataset[cellname]['experiments'][expname]:
+                    self.dataset[cellname]['experiments'][expname]['global_features'] = {}
+
+                ton = self.dataset[cellname]['experiments'][expname]['ton'][0]
+                toff = self.dataset[cellname]['experiments'][expname]['toff'][0]
+                delta_t = toff - ton
+
+                filenames = set(dataset_cell_exp[expname]['filename'])
+                for i_file, filename in enumerate(filenames):
+                    currents_spikecounts = dataset_cell_exp[expname]['currents_spikecounts'][filename]
+                    currents_spikecounts_sorted = sorted(currents_spikecounts.items(), key=lambda elem: float(elem[0]))
+
+                    # select feature values coming from the current file
+                    file_indices = []
+                    for j_file, dummy_filename in enumerate(dataset_cell_exp[expname]['filename']):
+                        if dummy_filename == filename:
+                            file_indices.append(j_file)
+                    file_features = OrderedDict()
+                    for feature in self.dataset[cellname]['experiments'][expname]['features']:
+                        feature_values = self.dataset[cellname]['experiments'][expname]['features'][feature]
+                        for index in file_indices:
+                            if feature not in file_features:
+                                file_features[feature] = []
+                            file_features[feature].append(feature_values[index])
+
+                    # find rheobase and steady state currents
+                    current_dict = defaultdict(dict)
+                    for current_name in self.standard_currents:
+                        current_dict[current_name]['current'] = float('nan')
+                        current_dict[current_name]['index'] = -1
+
+                    for current, spikecount in currents_spikecounts_sorted:
+                        if spikecount != 0 and current_dict['rheobase_current']['index'] == -1:
+                            current_dict['rheobase_current']['current'] = current
+                            current_dict['rheobase_current']['index'] = list(currents_spikecounts).index(current)
+                        if spikecount >= steady_state_threshold and current_dict['steady_state_current']['index']  == -1:
+                            current_dict['steady_state_current']['current'] = current
+                            current_dict['steady_state_current']['index'] = list(currents_spikecounts).index(current)
+
+                    # finding current with largest number of spikes (maxspike)
+                    spikecounts = currents_spikecounts.values()
+                    if any(spikecounts):
+                        maxspike_current, _ = list(filter(lambda current_spikecount_tuple: current_spikecount_tuple[1] == max(spikecounts),
+                                                          currents_spikecounts_sorted))[0]
+                        current_dict['maxspike_current']['current'] = maxspike_current
+                        current_dict['maxspike_current']['index'] = list(currents_spikecounts).index(maxspike_current)
+
+                    # collect features into dataset
+                    for current_name in self.standard_currents:
+                        if current_name not in self.dataset[cellname]['experiments'][expname]:
+                            self.dataset[cellname]['experiments'][expname][current_name] = defaultdict(dict)
+                        current_index = current_dict[current_name]['index']
+                        if current_index >= 0:
+                            current_features = OrderedDict()
+                            for feature in file_features:
+                                current_features[feature] = file_features[feature][current_index]
+                            if filename not in self.dataset[cellname]['experiments'][expname][current_name]:
+                                self.dataset[cellname]['experiments'][expname][current_name][filename] = {}
+                            self.dataset[cellname]['experiments'][expname][current_name][filename]['current'] = current_dict[current_name]['current']
+                            self.dataset[cellname]['experiments'][expname][current_name][filename]['features'] = current_features
+
+                    # calculate slope features
+                    if 'features' in self.dataset[cellname]['experiments'][expname]['rheobase_current'][filename]:
+                        rheobase_current = current_dict['rheobase_current']['current']
+                        rheobase_spikecount = self.dataset[cellname]['experiments'][expname]['rheobase_current'][filename]['features']['Spikecount']
+                        self.dataset[cellname]['experiments'][expname]['global_features'][filename] = {}
+
+                        # calculate initial slope
+                        if 'features' in self.dataset[cellname]['experiments'][expname]['steady_state_current'][filename]:
+                            steady_state_current = current_dict['steady_state_current']['current']
+                            steady_state_spikecount = self.dataset[cellname]['experiments'][expname]['steady_state_current'][filename]['features']['Spikecount']
+
+                            firing_rate = (steady_state_spikecount - rheobase_spikecount) / delta_t
+                            initial_slope = firing_rate / (steady_state_current - rheobase_current)
+                            self.dataset[cellname]['experiments'][expname]['global_features'][filename]['initial_fI_slope'] = initial_slope
+
+                        # calculate average slope
+                        if 'features' in self.dataset[cellname]['experiments'][expname]['maxspike_current'][filename]:
+                            maxspike_spikecount = self.dataset[cellname]['experiments'][expname]['maxspike_current'][filename]['features']['Spikecount']
+                            maxspike_current = current_dict['maxspike_current']['current']
+
+                            firing_rate = (maxspike_spikecount - rheobase_spikecount) / delta_t
+                            average_slope = firing_rate / (maxspike_current - rheobase_current)
+                            self.dataset[cellname]['experiments'][expname]['global_features'][filename]['average_fI_slope'] = average_slope
+
+                        # calculate maximum slope
+                        spiking_rate_changes = []
+                        for idx, currents_spikecount_tuple in enumerate(currents_spikecounts_sorted):
+                            next_idx = idx+1
+                            if next_idx == len(currents_spikecounts_sorted):
+                                break
+
+                            current, spikecount = currents_spikecount_tuple
+                            next_current, next_spikecount = currents_spikecounts_sorted[next_idx]
+
+                            delta_current = next_current - current
+                            delta_spikecount = next_spikecount - spikecount
+                            spikecount_change = delta_spikecount / delta_current
+
+                            spiking_rate_change = spikecount_change / delta_t
+                            spiking_rate_changes.append(spiking_rate_change)
+                        self.dataset[cellname]['experiments'][expname]['global_features'][filename]['maximum_fI_slope'] = max(spiking_rate_changes)
+
     def mean_features(self):
         """Compute the mean for each features for each target"""
         logger.info(" Calculating mean features")
@@ -695,6 +827,20 @@ class Extractor(object):
                 dataset_cell_exp[expname]['bc_shift_features'] = OrderedDict()
                 dataset_cell_exp[expname]['bc_ld_features'] = OrderedDict()
 
+                # create mean, std and n fields for global features
+                for global_feature in self.global_features:
+                    for statistic in ['mean', 'std', 'n']:
+                        key = '{}_{}'.format(statistic, global_feature)
+                        dataset_cell_exp[expname][key] = OrderedDict()
+
+                # create mean, std, and n fields for rheobase, steady-state and maxspike
+                for current_type in self.standard_currents:
+                    for statistic in ['mean', 'std', 'n']:
+                        key_current = '{}_{}'.format(statistic, current_type)
+                        key_features = '{}_{}_features'.format(statistic, current_type)
+                        dataset_cell_exp[expname][key_current] = OrderedDict()
+                        dataset_cell_exp[expname][key_features] = OrderedDict()
+
                 for feature in self.features[expname]:
                     dataset_cell_exp[expname]['mean_features'][feature] = \
                         OrderedDict()
@@ -710,6 +856,12 @@ class Extractor(object):
                         OrderedDict()
                     dataset_cell_exp[expname]['n'][feature] = OrderedDict()
                     dataset_cell_exp[expname]['raw'][feature] = OrderedDict()
+
+                    # create individual feature fields for each feature inside rheobase, steady-state, maxspike
+                    for current_type in self.standard_currents:
+                        for statistic in ['mean', 'std', 'n']:
+                            key_features = '{}_{}_features'.format(statistic, current_type)
+                            dataset_cell_exp[expname][key_features][feature] = OrderedDict()
 
                 ton = dataset_cell_exp[expname]['ton']
                 toff = dataset_cell_exp[expname]['toff']
@@ -881,6 +1033,70 @@ class Extractor(object):
                                 feature][
                                 str(target)] = bcld
 
+                # calculate means and stds for global features (slopes)
+                if self.is_global_features_collected:
+                    global_feat_single_cell = {}
+                    for global_feature in self.global_features:
+                        global_feat_single_cell[global_feature] = []
+
+                    for i_file, filename in enumerate(rawfiles_list):
+                        for global_feature in self.global_features:
+                            if filename in dataset_cell_exp[expname]['global_features']:
+                                feature_value = dataset_cell_exp[expname]['global_features'][filename][global_feature]
+                                if not numpy.isnan(numpy.atleast_1d(feature_value)):
+                                    global_feat_single_cell[global_feature].append(feature_value)
+
+                    for global_feature in self.global_features:
+                        feature_values = global_feat_single_cell[global_feature]
+                        n = len(feature_values)
+                        if n > 0:
+                            key_mean = 'mean_{globalfeat}'.format(globalfeat=global_feature)
+                            key_std = 'std_{globalfeat}'.format(globalfeat=global_feature)
+                            key_n = 'n_{globalfeat}'.format(globalfeat=global_feature)
+                            dataset_cell_exp[expname][key_mean] = self.newmeancell(feature_values)
+                            dataset_cell_exp[expname][key_std] = self.newstdcell(feature_values)
+                            dataset_cell_exp[expname][key_n] = n
+
+                    # calculate means and stds for standard currents and their corresponding features
+                    standard_currents_single_cell = {}
+                    for current_type in self.standard_currents:
+                        standard_currents_single_cell[current_type] = {
+                            'currents': [],
+                            'features': defaultdict(list)
+                        }
+
+                    for i_file, filename in enumerate(rawfiles_list):
+                        for current_type in standard_currents_single_cell:
+                            if 'current' in dataset_cell_exp[expname][current_type][filename]:
+                                current = dataset_cell_exp[expname][current_type][filename]['current']
+                                if not numpy.isnan(numpy.atleast_1d(current)):
+                                    standard_currents_single_cell[current_type]['currents'].append(current)
+                                for feature, feature_value in dataset_cell_exp[expname][current_type][filename]['features'].items():
+                                    if not numpy.isnan(numpy.atleast_1d(feature_value)):
+                                        standard_currents_single_cell[current_type]['features'][feature].append(feature_value)
+
+                    for current_type in standard_currents_single_cell:
+                        currents = standard_currents_single_cell[current_type]['currents']
+                        features = standard_currents_single_cell[current_type]['features']
+                        n_currents = len(currents)
+                        if n_currents > 0:
+                            key_mean = 'mean_{current}'.format(current=current_type)
+                            key_std = 'std_{current}'.format(current=current_type)
+                            key_n = 'n_{current}'.format(current=current_type)
+                            key_mean_feat = '{key_mean}_features'.format(key_mean=key_mean)
+                            key_std_feat = '{key_std}_features'.format(key_std=key_std)
+                            key_n_feat = '{key_n}_features'.format(key_n=key_n)
+
+                            dataset_cell_exp[expname][key_mean] = self.newmeancell(currents)
+                            dataset_cell_exp[expname][key_std] = self.newstdcell(currents)
+                            dataset_cell_exp[expname][key_n] = n_currents
+                            for feature in features:
+                                n_features = len(features[feature])
+                                if n_features > 0:
+                                    dataset_cell_exp[expname][key_mean_feat][feature] = self.newmeancell(features[feature])
+                                    dataset_cell_exp[expname][key_std_feat][feature] = self.newstdcell(features[feature])
+                                    dataset_cell_exp[expname][key_n_feat][feature] = n_features
+
         # mean for all cells
         for i_exp, expname in enumerate(self.experiments):
 
@@ -899,6 +1115,20 @@ class Extractor(object):
             self.dataset_mean[expname]['n'] = OrderedDict()
             self.dataset_mean[expname]['raw'] = OrderedDict()
 
+            # create mean, std and n fields for global features
+            for global_feature in self.global_features:
+                for statistic in ['mean', 'std', 'n']:
+                    key = '{}_{}'.format(statistic, global_feature)
+                    self.dataset_mean[expname][key] = OrderedDict()
+
+            # create mean, std, and n fields for rheobase, steady-state and maxspike
+            for current_type in self.standard_currents:
+                for statistic in ['mean', 'std', 'n']:
+                    key_current = '{}_{}'.format(statistic, current_type)
+                    key_features = '{}_{}_features'.format(statistic, current_type)
+                    self.dataset_mean[expname][key_current] = OrderedDict()
+                    self.dataset_mean[expname][key_features] = OrderedDict()
+
             for feature in self.features[expname]:
                 self.dataset_mean[expname]['features'][feature] = OrderedDict()
                 self.dataset_mean[expname]['cell_std_features'][feature] = \
@@ -908,6 +1138,12 @@ class Extractor(object):
                 self.dataset_mean[expname]['cell_n'][feature] = OrderedDict()
                 self.dataset_mean[expname]['n'][feature] = OrderedDict()
                 self.dataset_mean[expname]['raw'][feature] = OrderedDict()
+
+                # create individual feature fields for each feature inside rheobase, steady-state, maxspike
+                for current_type in self.standard_currents:
+                    for statistic in ['mean', 'std', 'n']:
+                        key_features = '{}_{}_features'.format(statistic, current_type)
+                        self.dataset_mean[expname][key_features][feature] = OrderedDict()
 
                 for target in self.options["target"]:
                     self.dataset_mean[expname]['features'][feature][
@@ -927,9 +1163,25 @@ class Extractor(object):
                 self.dataset_mean[expname]['amp_rel'][str(target)] = []
                 self.dataset_mean[expname]['hypamp'][str(target)] = []
 
+            standard_currents_all_cells = {}
+            global_feat_all_cells = {}
+            for current_type in self.standard_currents:
+                standard_currents_all_cells[current_type] = {
+                    'currents': [],
+                    'features': defaultdict(list),
+                    'cell_n_currents': 0,
+                    'cell_n_features': defaultdict(int)
+                }
+            for global_feat in self.global_features:
+                global_feat_all_cells[global_feat] = {
+                    'feat_vals': [],
+                    'cell_n': 0
+                }
+
             for i_cell, cellname in enumerate(self.dataset):
 
                 dataset_cell_exp = self.dataset[cellname]['experiments']
+                rawfiles_list = dataset_cell_exp[expname]['rawfiles']
 
                 if expname in dataset_cell_exp:
                     self.dataset_mean[expname]['location'] =\
@@ -1008,6 +1260,46 @@ class Extractor(object):
                                     self.dataset_mean[expname]['raw'][
                                         feature][
                                         str(target)].append(raw)
+
+                    # set up a file counter for standard currents and global features
+                    if self.is_global_features_collected:
+                        file_nums = {}
+                        for element in self.standard_currents + self.global_features:
+                            file_nums[element] = 0
+
+                        # count files with valid currents and global features, concatenate values from different files
+                        for i_file, filename in enumerate(rawfiles_list):
+                            for current_type in standard_currents_all_cells:
+                                if 'current' in dataset_cell_exp[expname][current_type][filename]:
+                                    current = dataset_cell_exp[expname][current_type][filename]['current']
+                                    if not numpy.isnan(numpy.atleast_1d(current)):
+                                        standard_currents_all_cells[current_type]['currents'].append(current)
+                                        file_nums[current_type] += 1
+                                    for feature, feature_value in dataset_cell_exp[expname][current_type][filename][
+                                        'features'].items():
+                                        if not numpy.isnan(numpy.atleast_1d(feature_value)):
+                                            standard_currents_all_cells[current_type]['features'][feature].append(
+                                                feature_value)
+                            if filename not in dataset_cell_exp[expname]['global_features']:
+                                continue
+                            for global_feature_type in global_feat_all_cells:
+                                if global_feature_type in dataset_cell_exp[expname]['global_features'][filename]:
+                                    global_feature_value = dataset_cell_exp[expname]['global_features'][filename][
+                                        global_feature_type]
+                                    if not numpy.isnan(numpy.atleast_1d(global_feature_value)):
+                                        global_feat_all_cells[global_feature_type]['feat_vals'].append(
+                                            global_feature_value)
+                                        file_nums[global_feature_type] += 1
+
+                        for current_type in standard_currents_all_cells:
+                            if file_nums[current_type] > 0:
+                                standard_currents_all_cells[current_type]['cell_n_currents'] += 1
+                                for feature in standard_currents_all_cells[current_type]['features']:
+                                    if standard_currents_all_cells[current_type]['features'][feature]:
+                                        standard_currents_all_cells[current_type]['cell_n_features'][feature] += 1
+                        for global_feature_type in global_feat_all_cells:
+                            if file_nums[global_feature_type] > 0:
+                                global_feat_all_cells[global_feature_type]['cell_n'] += 1
 
             # create means
             self.dataset_mean[expname]['mean_amp'] = OrderedDict()
@@ -1114,6 +1406,42 @@ class Extractor(object):
                             target)] = bcshift
                     self.dataset_mean[expname]['bc_ld_features'][feature][
                         str(target)] = bcld
+
+            # calculate means, stds for standard currents
+            if self.is_global_features_collected:
+                for current_type in standard_currents_all_cells:
+                    currents = standard_currents_all_cells[current_type]['currents']
+                    features = standard_currents_all_cells[current_type]['features']
+                    n_currents = standard_currents_all_cells[current_type]['cell_n_currents']
+                    if n_currents > 0:
+                        key_mean = 'mean_{current}'.format(current=current_type)
+                        key_std = 'std_{current}'.format(current=current_type)
+                        key_n = 'n_{current}'.format(current=current_type)
+                        key_mean_feat = '{key_mean}_features'.format(key_mean=key_mean)
+                        key_std_feat = '{key_std}_features'.format(key_std=key_std)
+                        key_n_feat = '{key_n}_features'.format(key_n=key_n)
+
+                        self.dataset_mean[expname][key_mean] = self.newmeancell(currents)
+                        self.dataset_mean[expname][key_std] = self.newstdcell(currents)
+                        self.dataset_mean[expname][key_n] = n_currents
+                        for feature in features:
+                            n_features = standard_currents_all_cells[current_type]['cell_n_features'][feature]
+                            if n_features > 0:
+                                self.dataset_mean[expname][key_mean_feat][feature] = self.newmeancell(features[feature])
+                                self.dataset_mean[expname][key_std_feat][feature] = self.newstdcell(features[feature])
+                                self.dataset_mean[expname][key_n_feat][feature] = n_features
+
+            # calculate means, stds for global features
+            for global_feature in global_feat_all_cells:
+                feature_values = global_feat_all_cells[global_feature]['feat_vals']
+                n_globalfeat = global_feat_all_cells[global_feature]['cell_n']
+                if n_globalfeat > 0:
+                    key_mean = 'mean_{globalfeat}'.format(globalfeat=global_feature)
+                    key_std = 'std_{globalfeat}'.format(globalfeat=global_feature)
+                    key_n = 'n_{globalfeat}'.format(globalfeat=global_feature)
+                    self.dataset_mean[expname][key_mean] = self.newmeancell(feature_values)
+                    self.dataset_mean[expname][key_std] = self.newstdcell(feature_values)
+                    self.dataset_mean[expname][key_n] = n_globalfeat
 
     def get_threshold(self, amp, numspikes):
         """Get the spiking threshold of a cell by taking the smallest current
@@ -1758,6 +2086,51 @@ class Extractor(object):
                                                              totduration),
                                                      ])),
                                                 ])
+
+                    if self.is_global_features_collected:
+                        # prepare feat dict for the addition of standard currents and global features
+                        for current_type in self.standard_currents:
+                            if current_type not in feat:
+                                feat[current_type] = OrderedDict()
+                            if location not in feat[current_type]:
+                                feat[current_type][location] = []
+                        if 'global' not in feat:
+                            feat['global'] = OrderedDict()
+                        if location not in feat['global']:
+                            feat['global'][location] = []
+
+                        # append standard currents and the corresponding features to the feat dict
+                        for current_type in self.standard_currents:
+                            # first add the mean and std of the currents themselves
+                            mean_current = dataset[expname]['mean_{}'.format(current_type)]
+                            std_current = dataset[expname]['std_{}'.format(current_type)]
+                            n_current = dataset[expname]['n_{}'.format(current_type)]
+                            if isinstance(mean_current, float) and isinstance(std_current, float):
+                                current_val = [round(mean_current, 4), round(std_current, 4)]
+                                feat[current_type][location].append({"current_val": current_val, "n": n_current})
+                                feat['global'][location].append(
+                                    {"feature": current_type, "val": current_val, "n": n_current})
+
+                            # then add the mean and std of the features belonging to said currents
+                            mean_current_feat = dataset[expname]['mean_{}_features'.format(current_type)]
+                            std_current_feat = dataset[expname]['std_{}_features'.format(current_type)]
+                            n_current_feat = dataset[expname]['n_{}_features'.format(current_type)]
+                            for feature in mean_current_feat:
+                                if n_current_feat[feature]:
+                                    feat_val = [round(mean_current_feat[feature], 4),
+                                                round(std_current_feat[feature], 4)]
+                                    feat_formatted = {"feature": feature, "val": feat_val, "n": n_current_feat[feature]}
+                                    feat[current_type][location].append(feat_formatted)
+
+                        # append global features to the feat dict
+                        for global_feature in self.global_features:
+                            mean_global_feature = dataset[expname]['mean_{}'.format(global_feature)]
+                            std_global_feature = dataset[expname]['std_{}'.format(global_feature)]
+                            n_global_feature = dataset[expname]['n_{}'.format(global_feature)]
+                            if isinstance(mean_global_feature, float) and isinstance(std_global_feature, float):
+                                feature_val = [round(mean_global_feature, 4), round(std_global_feature, 4)]
+                                feat['global'][location].append(
+                                    {"feature": global_feature, "val": feature_val, "n": n_global_feature})
 
         s = json.dumps(stim, indent=2, cls=tools.NumpyEncoder)
         s = tools.collapse_json(s, indent=indent)
