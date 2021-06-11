@@ -728,27 +728,49 @@ class Extractor(object):
                     # calculate slope features
                     if 'features' in self.dataset[cellname]['experiments'][expname]['rheobase_current'][filename]:
                         rheobase_current = current_dict['rheobase_current']['current']
+                        steady_state_current = current_dict['steady_state_current']['current']
+                        maxspike_current = current_dict['maxspike_current']['current']
                         rheobase_spikecount = self.dataset[cellname]['experiments'][expname]['rheobase_current'][filename]['features']['Spikecount']
                         self.dataset[cellname]['experiments'][expname]['global_features'][filename] = {}
 
-                        # calculate initial slope
-                        if 'features' in self.dataset[cellname]['experiments'][expname]['steady_state_current'][filename]:
-                            steady_state_current = current_dict['steady_state_current']['current']
-                            steady_state_spikecount = self.dataset[cellname]['experiments'][expname]['steady_state_current'][filename]['features']['Spikecount']
+                        # "normal case"
+                        if not numpy.isnan(steady_state_current) and rheobase_current != steady_state_current and rheobase_current != maxspike_current:
+                            # calculate initial slope
+                            if 'features' in self.dataset[cellname]['experiments'][expname]['steady_state_current'][filename]:
+                                steady_state_spikecount = self.dataset[cellname]['experiments'][expname]['steady_state_current'][filename]['features']['Spikecount']
+                                firing_rate = (steady_state_spikecount - rheobase_spikecount) / delta_t
+                                initial_slope = firing_rate / (steady_state_current - rheobase_current)
+                                self.dataset[cellname]['experiments'][expname]['global_features'][filename]['initial_fI_slope'] = initial_slope
 
-                            firing_rate = (steady_state_spikecount - rheobase_spikecount) / delta_t
-                            initial_slope = firing_rate / (steady_state_current - rheobase_current)
+                            # calculate average slope
+                            if 'features' in self.dataset[cellname]['experiments'][expname]['maxspike_current'][filename]:
+                                maxspike_spikecount = self.dataset[cellname]['experiments'][expname]['maxspike_current'][filename]['features']['Spikecount']
+                                firing_rate = (maxspike_spikecount - rheobase_spikecount) / delta_t
+                                average_slope = firing_rate / (maxspike_current - rheobase_current)
+                                self.dataset[cellname]['experiments'][expname]['global_features'][filename]['average_fI_slope'] = average_slope
+                        else:  # edge cases: when the rheobase is equal to steady state or maximum spike current
+                            # first we need to check if there is any current greater than the rheobase
+                            rheobase_index = [stimulus for (stimulus, spikecount) in currents_spikecounts_sorted].index(rheobase_current)
+                            rheobase_is_last = False
+                            if rheobase_index + 1 == len(currents_spikecounts_sorted):
+                                rheobase_is_last = True
+
+                            if not rheobase_is_last:  # if there is a current greater than that, then we use that one for slope calculation
+                                adjacent_current, adjacent_current_spikecount = currents_spikecounts_sorted[rheobase_index + 1]
+                            else:  # if such a current doesn't exist, we step back and use the one immediately smaller
+                                adjacent_current, adjacent_current_spikecount = currents_spikecounts_sorted[rheobase_index - 1]
+                            firing_rate = (adjacent_current_spikecount - rheobase_spikecount) / delta_t
+
+                            initial_slope = firing_rate / (adjacent_current - rheobase_current)
+                            average_slope = initial_slope
+
                             self.dataset[cellname]['experiments'][expname]['global_features'][filename]['initial_fI_slope'] = initial_slope
-
-                        # calculate average slope
-                        if 'features' in self.dataset[cellname]['experiments'][expname]['maxspike_current'][filename]:
-                            maxspike_spikecount = self.dataset[cellname]['experiments'][expname]['maxspike_current'][filename]['features']['Spikecount']
-                            maxspike_current = current_dict['maxspike_current']['current']
-
-                            firing_rate = (maxspike_spikecount - rheobase_spikecount) / delta_t
-                            average_slope = firing_rate / (maxspike_current - rheobase_current)
                             self.dataset[cellname]['experiments'][expname]['global_features'][filename]['average_fI_slope'] = average_slope
 
+                            logging.info("Edge case detected in slope feature calculation: rheobase current = {},"
+                                         " steady state current = {}, maxspike current = {}".format(rheobase_current,
+                                                                                                    steady_state_current,
+                                                                                                    maxspike_current))
                         # calculate maximum slope
                         spiking_rate_changes = []
                         for idx, currents_spikecount_tuple in enumerate(currents_spikecounts_sorted):
